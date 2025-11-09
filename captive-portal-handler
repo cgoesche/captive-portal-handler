@@ -1,0 +1,245 @@
+#!/usr/bin/env -S bash -p
+
+# This file is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This file is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# Copyright (C) 2025 Christian Goeschel Ndjomouo <cgoesc2@wgu.edu>
+
+# Captive Portal Handler - NetworkManager Dispatcher Script
+#
+# This script serves as a helper to detect whether a network connection 
+# is behind a captive portal and requires authentication before being 
+# granted full access to the internet. If that is the case, the locally
+# seated user is prompted with a notification that provides a button to
+# navigate to the authentication page of the detected captive portal.
+PATH="/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin"
+typeset -r PROGNAME="captive-portal-handler"
+typeset -r CONNECTIVITY_CHECK_IP="8.8.8.8"
+typeset CAPTIVE_PORTAL_ADDR=""
+typeset LOCAL_SEATED_USER_NAME=""
+typeset LOCAL_SEATED_USER_ID=""
+
+LOGGER="$(which logger 2>/dev/null)"
+
+if [ -x "$LOGGER" ]; then
+	LOGGER="${LOGGER} -t ${PROGNAME} -p user.debug --"		
+else
+	LOGGER="echo"
+fi
+
+function _log() {
+	$LOGGER "$1"
+}
+
+function check_dependencies() {
+	local err
+	err=0
+
+	for i in busctl xdg-open notify-send; do
+		i="$(which "$i" 2>/dev/null)"
+		
+		if ! [ -x "$i" ]; then
+			_log "Missing dependency $i."
+			((err++))
+		fi 
+	done
+
+	return $err
+}
+
+function get_local_user() {
+	_log "Searching for local seated user name and UID."
+	LOCAL_SEATED_USER_NAME="$(who -u | grep -E '([[:space:]]*seat.*[[:space:]]*)' | head -n1 | cut -d' ' -f 1 )"
+
+	# shellcheck disable=SC2181
+	if [[ "$?" != "0" ]]; then
+		_log "Failed to get an appropriate seated user session!"
+		exit 2
+	fi
+	LOCAL_SEATED_USER_ID="$(id -u "$LOCAL_SEATED_USER_NAME" 2>/dev/null)"
+	return 0
+}
+
+function set_xdg_run_dir_env() {
+	# As Systemd is the most commonly used init system on contemporary GNU/Linux 
+	# systems, we can assume that the user session was initialized by the pam_systemd.so
+	# PAM module and therefore registered with the systemd login manager and also created 
+	# '/run/user/$UID' which we'll need later when we will look for a Wayland specific socket.
+	if ! busctl introspect org.freedesktop.login1 /org/freedesktop/login1 \
+															org.freedesktop.login1.Manager &>/dev/null; then
+		_log "Systemd login manager cannot be contacted via DBus"
+		exit 2
+	fi
+
+	XDG_RUNTIME_DIR="$(busctl get-property org.freedesktop.login1 \
+														/org/freedesktop/login1/user/_"${LOCAL_SEATED_USER_ID}" \
+														org.freedesktop.login1.User \
+														RuntimePath 2>/dev/null \
+														| cut -d ' ' -f 2 \
+														| tr -d '\"' )"
+
+	if [[ -z "$XDG_RUNTIME_DIR" || "$?" != "0" ]]; then
+		# Assume that it is at /run/user/$UID
+		XDG_RUNTIME_DIR="/run/user/${LOCAL_SEATED_USER_ID}"
+	fi
+
+	if ! [ -d "$XDG_RUNTIME_DIR" ]; then
+		_log "Failed to find XDG_RUNTIME_DIR - No such file or directory: $XDG_RUNTIME_DIR"
+		exit 2
+	fi
+	_log "Exporting XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+	export XDG_RUNTIME_DIR
+}
+
+function set_x11_display_env() {
+	# X11 servers conventionally create a UNIX domain socket at /tmp/.X11-unix/Xn
+	# where n stands for the display ID (e.g. 0 for ':0').
+	if [ -d "/tmp/.X11-unix" ]; then
+		socket="$(find /tmp/.X11-unix -maxdepth 1 -type s -print | head -n1)"
+		socket="${socket##*/}"
+		DISPLAY="${socket/X/:}"
+	fi
+	_log "Exporting DISPLAY=$DISPLAY"
+	export DISPLAY
+}
+
+function set_xauth_env() {
+	# XAuthority can be in multiple places but it often defaults to $HOME/.Xauthority
+	if [ -f "/home/${LOCAL_SEATED_USER_NAME}/.Xauthority" ]; then
+		XAUTHORITY="/home/${LOCAL_SEATED_USER_NAME}/.Xauthority"
+	else
+		XAUTHORITY="$(find "${XDG_RUNTIME_DIR}" -maxdepth 1 -type f -iname 'xauth*' 2>/dev/null | head -n1 )"
+	fi
+	_log "Exporting XAUTHORITY=$XAUTHORITY"
+	export XAUTHORITY
+}
+
+function set_wayland_display_env() {
+	# Wayland servers usually create their UNIX domain sockets
+	# in $XDG_RUNTIME_DIR/wayland-n, where n is a numeric value
+	if [[ -d "${XDG_RUNTIME_DIR}" ]]; then
+		socket="$(find "${XDG_RUNTIME_DIR}" -maxdepth 1 -type s -iname 'wayland-[0-9]' 2>/dev/null | head -n1)"
+		WAYLAND_DISPLAY="${socket##*/}"
+	fi
+	_log "Exporting WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+	export WAYLAND_DISPLAY
+}
+
+function set_dbus_session_addr_env() {
+	if [ -f "${XDG_RUNTIME_DIR}/bus" ]; then
+		DBUS_SESSION_BUS_ADDRESS="${XDG_RUNTIME_DIR}/bus"
+	fi
+	_log "Exporting DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
+	export DBUS_SESSION_BUS_ADDRESS
+}
+
+# Set environment variables needed to open the browser on the correct
+# window server display
+function update_env() {
+	_log "Updating the execution environment."
+	# We can heuristically construct the required environment variables
+	# with the help of the found local user's UID and some well-known
+	# and commonly used file system paths for the different subsystems.
+	set_xdg_run_dir_env
+	set_x11_display_env
+	set_xauth_env
+	set_wayland_display_env
+	set_dbus_session_addr_env
+	
+	return 0
+}
+
+function get_captive_portal_addr() {
+	# The captive portal is usually the default route for an external destination
+	CAPTIVE_PORTAL_ADDR="$(ip route get "${CONNECTIVITY_CHECK_IP}" 2>/dev/null \
+							| cut -d' ' -f 3 | tr -d '\n')"
+	export CAPTIVE_PORTAL_ADDR
+}
+
+function open_captive_portal() {
+	_log "Opening captive portal (http://${CAPTIVE_PORTAL_ADDR}) \
+										for user '${LOCAL_SEATED_USER_NAME}' (UID ${LOCAL_SEATED_USER_ID})"
+	
+	sudo -b -E -u "${LOCAL_SEATED_USER_NAME}" xdg-open http://"${CAPTIVE_PORTAL_ADDR}"
+	
+	[ "$?" == "0" ] && return 0 || return 1
+}
+
+function notify_user() {
+	local ret
+	
+	ret="$(sudo -E -u "${LOCAL_SEATED_USER_NAME}" -- notify-send 								\
+																			--app-name="$PROGNAME" 									\
+																			--expire-time=20000											\
+																			--category="Network"										\
+																			--urgency=normal 												\
+																			--action=0="Open the captive portal" 		\
+																			"Captive portal detected"								\
+																			"You have a limited network connection, to gain access to the		\
+																			internet you have to authenticate via a captive portal." )"
+	# shellcheck disable=SC2181
+	if [ "$ret" != "0" ]; then
+		_log "Request to open captive portal timed out or the user refused."
+		return 1
+	fi
+
+	_log "User accepted to open the captive portal."
+	return 0
+}
+
+function main() {
+	if ! check_dependencies; then
+		_log "Execution failed due to missing dependencies."
+		exit 3
+	fi
+	get_local_user
+	update_env
+
+	local ret
+	case "$NM_DISPATCHER_ACTION" in
+		connectivity-change)
+			_log "Connectivity state: ${CONNECTIVITY_STATE}"
+			if [[ "${CONNECTIVITY_STATE}" =~ PORTAL|LIMITED ]]; then
+				# It can happen that NetworkManager does not detect whether the network
+				# is in a captive portal, and only reports a LIMITED connectivity-change
+				# instead of PORTAL. In this case, we manually try a timed connection attempt
+				# to a well-known internet address to determine whether we are in a portal.
+				if [ "${CONNECTIVITY_STATE}" == "LIMITED" ]; then
+					_log "Limited network connectivity, testing a connection to ${CONNECTIVITY_CHECK_IP}"
+					if ping -c 1 -w 15 ${CONNECTIVITY_CHECK_IP} &>/dev/null; then
+						_log "ICMP echo reply received from ${CONNECTIVITY_CHECK_IP}. Exiting..."
+						exit 0
+					fi
+					_log "Connection to ${CONNECTIVITY_CHECK_IP} timed out"
+				fi
+
+				_log "Limited network connectivity, this is potentially caused by a captive portal."
+				get_captive_portal_addr
+				if [ -z "${CAPTIVE_PORTAL_ADDR}" ]; then
+					_log "Failed to get captive portal IPv4 address, exiting..."
+					exit 2
+				fi
+
+				_log "Requesting user to open the captive portal at '${CAPTIVE_PORTAL_ADDR}'."
+				if ! notify_user; then
+					exit 1
+				fi
+
+				open_captive_portal || _log "Failed to open captive portal."
+			fi
+		;;
+		*) :
+	esac
+
+}
+
+main "$@"
+_log "Exiting..."
+exit 0

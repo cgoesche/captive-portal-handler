@@ -43,9 +43,9 @@ function check_dependencies() {
 	err=0
 
 	for i in busctl xdg-open notify-send; do
-		i="$(which "$i" 2>/dev/null)"
+		path="$(which "$i" 2>/dev/null)"
 		
-		if ! [ -x "$i" ]; then
+		if ! [ -x "$path" ]; then
 			_log "Missing dependency $i."
 			((err++))
 		fi 

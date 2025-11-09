@@ -22,6 +22,8 @@
 PATH="/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin"
 typeset -r PROGNAME="captive-portal-handler"
 typeset -r CONNECTIVITY_CHECK_IP="8.8.8.8"
+typeset -r CONNECTIVITY_CHECK_URL="https://connectivity-check.ubuntu.com"
+typeset -r CONNECTIVIY_CHECK_TIMEOUT="20"
 typeset CAPTIVE_PORTAL_ADDR=""
 typeset LOCAL_SEATED_USER_NAME=""
 typeset LOCAL_SEATED_USER_ID=""
@@ -42,7 +44,7 @@ function check_dependencies() {
 	local err
 	err=0
 
-	for i in busctl xdg-open notify-send; do
+	for i in busctl curl xdg-open notify-send; do
 		path="$(which "$i" 2>/dev/null)"
 		
 		if ! [ -x "$path" ]; then
@@ -172,6 +174,25 @@ function open_captive_portal() {
 	[ "$?" == "0" ] && return 0 || return 1
 }
 
+function check_connectivity() {
+	local ret
+	# Some networks make it extra difficult to detect whether a connection to
+	# the internet is possible by allowing ICMP and even resolve DNS requests.
+	# Therefore, it is less fallacious and naive to requests a HTTPS server to
+	# get a more reliable test result.
+	ret="$(curl -s --interface "${DEVICE_IFACE}" \
+						--max-time "${CONNECTIVIY_CHECK_TIMEOUT}" \
+						-X GET -i -L "${CONNECTIVITY_CHECK_URL}" 2>/dev/null \
+						| awk -F: '/x-networkmanager-status/ {print $2}' )"
+
+	if [[ "$?" != 0 || ! "$ret" =~ online ]]; then
+		_log "No internet connectivity available."
+		return 1
+	fi
+	_log "Internet connectivity is available."
+	return 0
+}
+
 function notify_user() {
 	local ret
 	
@@ -203,21 +224,16 @@ function main() {
 	update_env
 
 	local ret
+	_log "Connectivity state: $NM_DISPATCHER_ACTION"
 	case "$NM_DISPATCHER_ACTION" in
 		connectivity-change)
-			_log "Connectivity state: ${CONNECTIVITY_STATE}"
 			if [[ "${CONNECTIVITY_STATE}" =~ PORTAL|LIMITED ]]; then
 				# It can happen that NetworkManager does not detect whether the network
 				# is in a captive portal, and only reports a LIMITED connectivity-change
 				# instead of PORTAL. In this case, we manually try a timed connection attempt
 				# to a well-known internet address to determine whether we are in a portal.
 				if [ "${CONNECTIVITY_STATE}" == "LIMITED" ]; then
-					_log "Limited network connectivity, testing a connection to ${CONNECTIVITY_CHECK_IP}"
-					if ping -c 1 -w 15 ${CONNECTIVITY_CHECK_IP} &>/dev/null; then
-						_log "ICMP echo reply received from ${CONNECTIVITY_CHECK_IP}. Exiting..."
-						exit 0
-					fi
-					_log "Connection to ${CONNECTIVITY_CHECK_IP} timed out"
+					check_connectivity && return 0 || :
 				fi
 
 				_log "Limited network connectivity, this is potentially caused by a captive portal."
@@ -231,9 +247,23 @@ function main() {
 				if ! notify_user; then
 					exit 1
 				fi
-
-				open_captive_portal || _log "Failed to open captive portal."
+				open_captive_portal || _log "Failed to open captive portal." && exit 1
 			fi
+		;;
+		up)
+			! check_connectivity || return 0
+
+			get_captive_portal_addr
+			if [ -z "${CAPTIVE_PORTAL_ADDR}" ]; then
+				_log "Failed to get captive portal IPv4 address, exiting..."
+				exit 2
+			fi
+
+			_log "Requesting user to open the captive portal at '${CAPTIVE_PORTAL_ADDR}'."
+			if ! notify_user; then
+				exit 1
+			fi
+			open_captive_portal || _log "Failed to open captive portal." && exit 1
 		;;
 		*) :
 	esac

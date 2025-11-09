@@ -23,7 +23,7 @@ PATH="/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin"
 typeset -r PROGNAME="captive-portal-handler"
 typeset -r CONNECTIVITY_CHECK_IP="8.8.8.8"
 typeset -r CONNECTIVITY_CHECK_URL="https://connectivity-check.ubuntu.com"
-typeset -r CONNECTIVIY_CHECK_TIMEOUT="20"
+typeset -r CONNECTIVITY_CHECK_TIMEOUT="20"
 typeset CAPTIVE_PORTAL_ADDR=""
 typeset LOCAL_SEATED_USER_NAME=""
 typeset LOCAL_SEATED_USER_ID=""
@@ -180,8 +180,11 @@ function check_connectivity() {
 	# the internet is possible by allowing ICMP and even resolve DNS requests.
 	# Therefore, it is less fallacious and naive to requests a HTTPS server to
 	# get a more reliable test result.
+
+	# Lets wait a few seconds and give the system time to setup the network
+	sleep 3
 	ret="$(curl -s --interface "${DEVICE_IFACE}" \
-						--max-time "${CONNECTIVIY_CHECK_TIMEOUT}" \
+						--max-time "${CONNECTIVITY_CHECK_TIMEOUT}" \
 						-X GET -i -L "${CONNECTIVITY_CHECK_URL}" 2>/dev/null \
 						| awk -F: '/x-networkmanager-status/ {print $2}' )"
 

@@ -199,13 +199,13 @@ function check_connectivity() {
 function notify_user() {
   local ret
   
-  ret="$(sudo -E -u "${LOCAL_SEATED_USER_NAME}" -- notify-send 								\
-                                      --app-name="$PROGNAME" 									\
-                                      --expire-time=20000											\
-                                      --category="Network"										\
-                                      --urgency=normal 												\
-                                      --action=0="Open the captive portal" 		\
-                                      "Captive portal detected"								\
+  ret="$(sudo -E -u "${LOCAL_SEATED_USER_NAME}" -- notify-send 					       \
+                                      --app-name="$PROGNAME" 									     \
+                                      --expire-time=20000											       \
+                                      --category="Network"										       \
+                                      --urgency=normal 												        \
+                                      --action=0="Open the captive portal" \
+                                      "Captive portal detected"								    \
                                       "You have a limited network connection, to gain access to the		\
                                       internet you have to authenticate via a captive portal." )"
   # shellcheck disable=SC2181
